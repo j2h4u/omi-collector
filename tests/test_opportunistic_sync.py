@@ -92,6 +92,7 @@ from omi_collector.capture.application.ports import (
 )
 from omi_collector.capture.application.presence import (
     PresenceCallback,
+    PresenceEnd,
     PresencePolicy,
     PresenceScheduler,
     PresenceWake,
@@ -1606,6 +1607,60 @@ async def test_collect_mode_seals_without_advance_or_second_info(tmp_path: Path)
     assert not result.advance_confirmed
     assert session.writes == [b"\x10", encode_read_command(10, 1)]
     assert all(command[:1] != b"\x12" for command in session.writes)
+
+
+@_async_test
+async def test_new_visit_resumes_empty_interrupted_range_before_growing_suffix(tmp_path: Path) -> None:
+    class Presence:
+        policy = PresencePolicy(rapid_backoff=(0.001,))
+        drained_cooldown_remaining_seconds = 0.0
+
+        def resume_interrupted_visit(self) -> None:
+            pass
+
+        async def wait_for_attempt(self) -> PresenceWake:
+            return PresenceWake("arrival", candidate="pendant", observed_at=0.0)
+
+        async def attempt_finished(self, _outcome: AttemptOutcome) -> PresenceEnd:
+            return PresenceEnd("absence")
+
+        async def close(self) -> None:
+            pass
+
+    first = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(100, 102),)),
+            WriteStep(encode_read_command(100, 2), (b"\x01" + bytes((STATUS_STORAGE_NOT_READY,)),)),
+            WriteStep(encode_stop_command()),
+        ),
+    )
+    second = ScriptedRingSession(
+        _status(),
+        (
+            WriteStep(b"\x10", (_info(100, 103),)),
+            WriteStep(encode_read_command(100, 2), (_begin(100, 2), _data(_records(100, 2)), _done(102))),
+            WriteStep(b"\x10", (_info(100, 103),)),
+            WriteStep(encode_advance_command(102), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(102, 103),)),
+            WriteStep(encode_read_command(102, 1), (_begin(102, 1), _data(_record(102)), _done(103))),
+            WriteStep(b"\x10", (_info(102, 103),)),
+            WriteStep(encode_advance_command(103), (b"\x01\x00",)),
+            WriteStep(b"\x10", (_info(103, 103),)),
+        ),
+    )
+    store = _staging_store(tmp_path, _capture_root(tmp_path))
+    result = await run_opportunistic_collector(
+        Provider([first, second]), store, replace(_options(batch_records=3), presence=Presence())
+    )
+    assert isinstance(result, CollectionResult)
+    assert result.next_sequence == 103
+    assert [write for write in second.writes if write[:1] in (b"\x11", b"\x12")] == [
+        encode_read_command(100, 2),
+        encode_advance_command(102),
+        encode_read_command(102, 1),
+        encode_advance_command(103),
+    ]
 
 
 @_async_test

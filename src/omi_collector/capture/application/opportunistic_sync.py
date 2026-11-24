@@ -24,11 +24,14 @@ from .owned_work import invoke_owned, join_owned, joined_to_thread
 from .ports import CaptureRuntimePort, ObservationWriterPort, PublicDrainPort, StagingPort
 from .presence import PresenceEnd, PresenceWake
 from .quarantine_maintenance import PendingStartupState, QuarantineMaintenance
+from .ring_transport import RingSession
 from .session_lifecycle import (
+    InfoReader,
     OpportunisticOptions,
     SessionLifecycle,
     SessionLifecycleCallbacks,
     SessionLifecycleRun,
+    SessionPhaseState,
     SessionProvider,
     validate_policy,
     validate_presence_policy,
@@ -403,8 +406,30 @@ def _validate_composition(staging: object, runtime: object) -> None:
         raise TypeError("opportunistic collection requires the complete capture runtime capability")
 
 
+class _VisitRecovery:
+    def __init__(self, run: _Run, reconciler: BatchReconciler) -> None:
+        self.run = run
+        self.reconciler = reconciler
+        # The descriptor in memory is discarded when an interrupted visit closes.
+        self.reload_pending = False
+
+    async def connected_step(
+        self, session: RingSession, current: RingInfo | None, info: InfoReader, phase: SessionPhaseState
+    ) -> tuple[str | None, RingInfo | None]:
+        if self.reload_pending:
+            _bind_startup_state(self.reconciler, await self.run.maintenance.reload_pending())
+            self.reload_pending = False
+        return await self.reconciler.connected_step(session, current, info, phase)
+
+    async def close_visit(self, reason: str, drain_cursor: int | None) -> None:
+        await self.reconciler.close_visit(reason, drain_cursor)
+        self.reload_pending = reason in {"absence", "recovery_exhausted"}
+        self.run.maintenance.schedule_publication_retry()
+
+
 def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLifecycle:
     """Bind coordinator-owned decisions to one physical-session lifecycle."""
+    visit = _VisitRecovery(run, reconciler)
 
     async def wait_presence_attempt() -> PresenceWake | PresenceEnd:
         presence = run.options.presence
@@ -434,10 +459,6 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     async def post_session_checkpoint() -> None:
         await reconciler.checkpoint_after_session()
 
-    async def close_visit(reason: str, drain_cursor: int | None) -> None:
-        await reconciler.close_visit(reason, drain_cursor)
-        run.maintenance.schedule_publication_retry()
-
     async def before_direct_attempt() -> None:
         run.staging.publication_capture_intent()
         await run.maintenance.ensure_publication_ready()
@@ -446,7 +467,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
     callbacks = SessionLifecycleCallbacks(
         before_direct_attempt=before_direct_attempt,
         wait_presence_attempt=wait_presence_attempt,
-        connected_step=reconciler.connected_step,
+        connected_step=visit.connected_step,
         post_session_checkpoint=post_session_checkpoint,
         completed_batch_query=lambda: reconciler.completed_batches,
         durable_progress_query=reconciler.durable_progress,
@@ -458,7 +479,7 @@ def _make_session_lifecycle(run: _Run, reconciler: BatchReconciler) -> SessionLi
             run.public_drain.observe_storage_unavailable if run.public_drain is not None else None
         ),
         close_verified_drain=partial(_close_verified_drain, run, reconciler) if run.public_drain is not None else None,
-        close_visit=close_visit,
+        close_visit=visit.close_visit,
         load_recovery=load_recovery,
         invalidate_recovery=invalidate_recovery,
         enter_capture_priority=run.maintenance.enter_capture_priority,

@@ -172,6 +172,12 @@ class QuarantineMaintenance:
             self._startup_state = state
             return state
 
+        state = await self.reload_pending(orphaned=orphaned)
+        self._startup_state = state
+        return state
+
+    async def reload_pending(self, *, orphaned: bool = False) -> PendingStartupState:
+        """Validate any resumable source without running startup publication."""
         try:
             pending = await self._pending_descriptor()
         except OpportunisticSyncError as error:
@@ -196,7 +202,6 @@ class QuarantineMaintenance:
             else:
                 state = PendingStartupState(pending, durable_next, "resumable")
 
-        self._startup_state = state
         return state
 
     def invalidate_startup_state(self) -> None:

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.18](https://github.com/j2h4u/omi-collector/compare/v1.1.17...v1.1.18) (2026-11-24)
+
+
+### Fixes
+
+* avoid writer startup audit in device status ([#359](https://github.com/j2h4u/omi-collector/issues/359)) ([122f700](https://github.com/j2h4u/omi-collector/commit/122f7003d89b40dbae29c99f6a9e0264321687b9))
+
 ## [1.1.17](https://github.com/j2h4u/omi-collector/compare/v1.1.16...v1.1.17) (2026-11-24)
 
 

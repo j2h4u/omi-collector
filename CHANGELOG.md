@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.17](https://github.com/j2h4u/omi-collector/compare/v1.1.16...v1.1.17) (2026-11-24)
+
+
+### Fixes
+
+* show saved records from unfinished pendant download ([#357](https://github.com/j2h4u/omi-collector/issues/357)) ([62d5f28](https://github.com/j2h4u/omi-collector/commit/62d5f285ffd1d8d7f6ab562b4fad5556a6381c15))
+
 ## [1.1.16](https://github.com/j2h4u/omi-collector/compare/v1.1.15...v1.1.16) (2026-11-23)
 
 

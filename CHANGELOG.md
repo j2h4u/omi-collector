@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.19](https://github.com/j2h4u/omi-collector/compare/v1.1.18...v1.1.19) (2026-11-24)
+
+
+### Fixes
+
+* resume interrupted pendant reads before capturing newer audio ([#361](https://github.com/j2h4u/omi-collector/issues/361)) ([5fa2958](https://github.com/j2h4u/omi-collector/commit/5fa29582d38b9d39e37be670495b57c221e55f8a))
+
 ## [1.1.18](https://github.com/j2h4u/omi-collector/compare/v1.1.17...v1.1.18) (2026-11-24)
 
 

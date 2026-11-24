@@ -17,6 +17,7 @@ from urllib.parse import quote
 from omi_collector.capture.adapters.collector_state_db import (
     StateDB,
     StateDBError,
+    StateDBVersionError,
     StateKind,
     _validate_audio_schema,
     _validate_schema,
@@ -43,10 +44,7 @@ class InternalAudioCutoverRequiredError(StateMigrationError):
 def _validate_canonical(layout: StorageLayout, *, read_only: bool) -> None:
     path = layout.collector.state_db
     try:
-        mode = path.lstat().st_mode
-        if not stat.S_ISREG(mode):
-            raise StateMigrationError("Collector SQLite path is not a regular file")
-        _check_canonical_access(path, read_only=read_only)
+        _check_canonical_path(path, read_only=read_only)
         # A writable startup must let SQLite roll back an accessible hot
         # journal before the logical v2 checks inspect state rows.
         mode = "ro" if read_only else "rw"
@@ -69,6 +67,7 @@ _TYPED_SCHEMA = 5
 _V4_TYPED_SCHEMA = 4
 _PREVIOUS_TYPED_SCHEMA = 3
 _LEGACY_TYPED_SCHEMA = 2
+_STATUS_BUSY_TIMEOUT_MS = 1_000
 
 
 def _validate_current(connection: sqlite3.Connection, *, schema_version: int = _TYPED_SCHEMA) -> None:
@@ -76,18 +75,7 @@ def _validate_current(connection: sqlite3.Connection, *, schema_version: int = _
     version_row = cast(tuple[int] | None, connection.execute("PRAGMA user_version").fetchone())
     if version_row is None:
         raise StateMigrationError("Collector SQLite schema version is unavailable")
-    if version_row[0] == 1:
-        raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
-    if version_row[0] != schema_version and version_row[0] in {
-        _LEGACY_TYPED_SCHEMA,
-        _PREVIOUS_TYPED_SCHEMA,
-        _V4_TYPED_SCHEMA,
-    }:
-        raise InternalAudioCutoverRequiredError(
-            f"Collector v{version_row[0]} state requires stopped-service init-state migration"
-        )
-    if version_row[0] != schema_version:
-        raise StateMigrationError("Collector SQLite schema version is unsupported")
+    _validate_current_version(version_row[0], schema_version=schema_version)
     try:
         _validate_schema(connection)
         _validate_audio_schema(connection, version=schema_version)
@@ -96,6 +84,21 @@ def _validate_current(connection: sqlite3.Connection, *, schema_version: int = _
     if connection.execute("SELECT 1 FROM state WHERE kind IN ('attempt','quarantine') LIMIT 1").fetchone():
         raise InternalAudioCutoverRequiredError("legacy capture rows remain in typed state")
     _validate_v2_only_publication(connection)
+
+
+def _validate_current_version(version: int, *, schema_version: int = _TYPED_SCHEMA) -> None:
+    if version == 1:
+        raise InternalAudioCutoverRequiredError("Collector v1 state is unsupported by this release")
+    if version != schema_version and version in {
+        _LEGACY_TYPED_SCHEMA,
+        _PREVIOUS_TYPED_SCHEMA,
+        _V4_TYPED_SCHEMA,
+    }:
+        raise InternalAudioCutoverRequiredError(
+            f"Collector v{version} state requires stopped-service init-state migration"
+        )
+    if version != schema_version:
+        raise StateMigrationError("Collector SQLite schema version is unsupported")
 
 
 def _validate_v2_only_publication(connection: sqlite3.Connection) -> None:
@@ -285,8 +288,34 @@ def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> Sta
     """Open only a complete current database; runtime never creates or upgrades it."""
 
     _validate_canonical(layout, read_only=read_only)
+    return _open_state(layout, read_only=read_only)
+
+
+def open_status_state(layout: StorageLayout) -> StateDB:
+    """Open current state for read-only status without the writer admission audit."""
+
     try:
+        _check_canonical_path(layout.collector.state_db, read_only=True)
+    except FileNotFoundError as error:
+        raise StateMigrationError("Collector SQLite database is missing; run stopped-service init-state") from error
+    except PermissionError as error:
+        raise InternalAudioCutoverRequiredError(
+            "Collector SQLite or journal access needs stopped-service repair"
+        ) from error
+    except OSError as error:
+        raise_if_sqlite_storage_fault(error)
+        raise StateMigrationError("Collector SQLite state cannot be validated") from error
+    return _open_state(layout, read_only=True, read_timeout_ms=_STATUS_BUSY_TIMEOUT_MS)
+
+
+def _open_state(layout: StorageLayout, *, read_only: bool, read_timeout_ms: int | None = None) -> StateDB:
+    try:
+        if read_timeout_ms is not None:
+            return StateDB(layout.collector.state_db, read_only=read_only, read_timeout_ms=read_timeout_ms)
         return StateDB(layout.collector.state_db, read_only=read_only)
+    except StateDBVersionError as error:
+        _validate_current_version(error.version)
+        raise StateMigrationError("Collector SQLite state cannot be opened") from error
     except StateDBError as error:
         try:
             _check_canonical_access(layout.collector.state_db, read_only=read_only)
@@ -295,6 +324,12 @@ def open_runtime_state(layout: StorageLayout, *, read_only: bool = False) -> Sta
                 "Collector SQLite or journal access needs stopped-service repair"
             ) from denied
         raise StateMigrationError("Collector SQLite state cannot be opened") from error
+
+
+def _check_canonical_path(path: Path, *, read_only: bool) -> None:
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise StateMigrationError("Collector SQLite path is not a regular file")
+    _check_canonical_access(path, read_only=read_only)
 
 
 def _check_canonical_access(path: Path, *, read_only: bool) -> None:

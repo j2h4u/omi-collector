@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
@@ -56,7 +57,7 @@ from omi_collector.capture.domain.ring_protocol import RECORD_SIZE, RingInfo
 from omi_collector.config import QualityMetricsConfig, ReadyConfig
 from omi_collector.operator_status import OperatorStatusError, collect_operator_status
 from omi_collector.spool_metrics import FirmwareLifetimeMetrics, SpoolMetrics, SpoolWindowMetrics
-from omi_collector.state_migration import open_runtime_state
+from omi_collector.state_migration import StateMigrationError, open_runtime_state, open_status_state
 from omi_collector.storage_layout import StorageLayout, load_operator_config
 
 
@@ -270,6 +271,53 @@ def _state_db(layout: StorageLayout) -> StateDB:
         database = StateDB(layout.collector.state_db)
         database.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return open_runtime_state(layout)
+
+
+def test_status_skips_writer_admission_but_rejects_unsafe_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    layout = _layout(tmp_path)
+    _state_db(layout)
+    layout.publication.root.mkdir()
+
+    def fail_audit(*_args: object) -> None:
+        pytest.fail("status ran writer admission audit")
+
+    monkeypatch.setattr("omi_collector.state_migration._validate_v2_only_publication", fail_audit)
+    monkeypatch.setattr("omi_collector.state_migration._assert_private_audio_gone", fail_audit)
+    assert collect_operator_status(layout, hours=24)["schema_version"] == 4
+    path = layout.collector.state_db
+    target = path.with_name("other.db")
+    path.rename(target)
+    path.symlink_to(target)
+    with pytest.raises(StateMigrationError, match="regular file"):
+        open_status_state(layout)
+
+
+def test_status_bounds_sqlite_busy_wait_during_open_and_reads(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    _state_db(layout)
+    reader = open_status_state(layout)
+    with closing(reader.open_connection(read_only=True)) as connection:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 1_000
+    with closing(sqlite3.connect(layout.collector.state_db)) as writer:
+        writer.execute("BEGIN EXCLUSIVE")
+        for read in (lambda: open_status_state(layout), lambda: reader.get(StateKind.MIGRATION, "missing")):
+            started = time.monotonic()
+            with pytest.raises(TransientInternalAudioStorageError, match="busy"):
+                read()
+            assert time.monotonic() - started >= 0.8
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_status_reports_old_schema_version(tmp_path: Path, version: int) -> None:
+    layout = _layout(tmp_path)
+    _state_db(layout)
+    with closing(sqlite3.connect(layout.collector.state_db)) as connection:
+        connection.execute(f"PRAGMA user_version={version}")
+    message = "v1 state is unsupported" if version == 1 else f"v{version} state requires stopped-service"
+    with pytest.raises(StateMigrationError, match=message):
+        open_status_state(layout)
 
 
 def test_operator_status_reads_ready_metadata_without_opening_audio(

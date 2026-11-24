@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.21](https://github.com/j2h4u/omi-collector/compare/v1.1.20...v1.1.21) (2026-11-24)
+
+
+### Fixes
+
+* preserve publication rejection and status timing diagnostics ([#364](https://github.com/j2h4u/omi-collector/issues/364)) ([6ede742](https://github.com/j2h4u/omi-collector/commit/6ede74215056023b5d6a9785f8298f2d6e76f759))
+
 ## [1.1.20](https://github.com/j2h4u/omi-collector/compare/v1.1.19...v1.1.20) (2026-11-24)
 
 

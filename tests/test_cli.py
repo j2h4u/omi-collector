@@ -1124,7 +1124,8 @@ def test_read_only_device_commands_refuse_classified_sqlite_faults(
     def fail_open(*_args: object, **_kwargs: object) -> None:
         raise failure
 
-    monkeypatch.setattr(state_migration, "open_runtime_state", fail_open)
+    opener = "open_status_state" if command == "status" else "open_runtime_state"
+    monkeypatch.setattr(state_migration, opener, fail_open)
     monkeypatch.setattr(cli, "_systemd_service_status", lambda: {"available": False})
     result = CliRunner().invoke(app, ["device", command, "--config", str(config_path)])
 

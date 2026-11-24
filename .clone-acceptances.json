@@ -1112,9 +1112,9 @@
     },
     {
       "detector": "jscpd",
-      "identity": "d8fe33cfb9684df38bc3298f286f939cc53fb1af89a0a7cc160245e26fe4565c",
+      "identity": "eba09b6e533ff9077ea019571a6d1c66b05b91d5dc9bfeb3e71d75408f38f801",
       "count": 1,
-      "reason": "Initial StateDB connection may create/normalize journal mode; persistent typed-store connections prohibit creation and require existing DELETE mode. Both share _guarded_connect; keep those different authority boundaries and exception cleanup. The owner-based 5s versus 30s busy-timeout policy is explicitly tested. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:467-475 ~ src/omi_collector/capture/adapters/collector_state_db.py:669-677."
+      "reason": "Initial StateDB connection may create or normalize journal mode; persistent typed-store connections prohibit creation and require existing DELETE mode. Both use the owning StateDB timeout, including the status reader override. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:478-486 ~ src/omi_collector/capture/adapters/collector_state_db.py:695-703."
     },
     {
       "detector": "jscpd",
@@ -1430,7 +1430,7 @@
     },
     {
       "detector": "pyscn",
-      "identity": "f278edfacfde2b362bef04f19bc32a2520c16c1dd9eb7ffffc87d9af143c1051",
+      "identity": "b3c68bb72d7fb5713de32681193d27538c8880aed8b9fde63ecf95a4549b092e",
       "count": 1,
       "reason": "Historical v3 validator and current-runtime validator have different eligible versions and publication-mode requirements. Keep explicit migration-versus-runtime admission rules. Reviewed pair: src/omi_collector/state_migration.py:268-281 ~ src/omi_collector/state_migration.py:74-98."
     },
@@ -1544,7 +1544,7 @@
     },
     {
       "detector": "pyscn",
-      "identity": "1e2a49854f76823d48318c9cdf1fae559b3f544a0bc3d31d71179356618dc9ad",
+      "identity": "ecc87d56c403725ae3dd9d6385d77129b22f2748d0b55c862565330dce512499",
       "count": 1,
       "reason": "Historical v2 validator admits an upgrade source; current-runtime validator rejects upgrade-required versions, validates public-mode policy and has different fatal categories. Common structural validators are already reused. Reviewed pair: src/omi_collector/state_migration.py:252-265 ~ src/omi_collector/state_migration.py:74-98."
     },
@@ -1718,9 +1718,9 @@
     },
     {
       "detector": "pyscn",
-      "identity": "8a5bba1ea464ae10848929dc8adadfa836d697530e4304ba98c5c3f4dcafaa66",
+      "identity": "d165a7af9dd3062146b243e934bf25e54dfe04b3a57f61a798c8745000c9bab8",
       "count": 1,
-      "reason": "Initial StateDB open can create and normalize DELETE journal; typed persistent open cannot create and must reject other modes. Shared _guarded_connect already owns connection machinery; preserve authority and owner-based timeout policies. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:459-490 ~ src/omi_collector/capture/adapters/collector_state_db.py:655-687."
+      "reason": "Initial StateDB open can create and normalize DELETE journal; typed persistent open cannot create and must reject other modes. Shared _guarded_connect owns connection machinery and both use the owner timeout, including the status reader override. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:470-501 ~ src/omi_collector/capture/adapters/collector_state_db.py:681-713."
     },
     {
       "detector": "pyscn",
@@ -2045,12 +2045,6 @@
       "identity": "88e87e91596c30d8ac1d67d9944a616cffe30f6c6b4069f12e0f208750a19f79",
       "count": 1,
       "reason": "StagedAttemptShape includes recovery while ResumeAttemptShape provides a narrower restart interface. Their shared inspection and close members are intentional capability overlap. Reviewed pair: src/omi_collector/capture/application/ports.py:156-166 ~ src/omi_collector/capture/application/ports.py:168-178."
-    },
-    {
-      "detector": "jscpd",
-      "identity": "95655109e2ac8c8aefd3e3e455b879daa5f0fc29a55b65c0c74de99b0fb32612",
-      "count": 1,
-      "reason": "The v2 stopped-service migration validator and the current runtime validator accept different schema versions and enforce different cutover rules. Shared structural validation is already factored. Reviewed pair: src/omi_collector/state_migration.py:257-265 ~ src/omi_collector/state_migration.py:89-97."
     },
     {
       "detector": "jscpd",
@@ -2477,6 +2471,12 @@
       "identity": "6790b49779f14cc79902e408af6f8a354e42fd22fa12d3b55fb33cd7123e8a6a",
       "count": 1,
       "reason": "Empty custody proves that no audio or active references exist; isolated tail custody proves a bounded partial tail follows certified full records and excludes conflicting evidence. Their inputs and required evidence differ. Reviewed pair: src/omi_collector/capture/adapters/ordered_payloads.py:309-329 ~ src/omi_collector/capture/adapters/ordered_payloads.py:347-367."
+    },
+    {
+      "detector": "jscpd",
+      "identity": "4b4b14e9ed181c3fbceefefd5bed66527923aa35972a5b04ce292974959c1d0c",
+      "count": 1,
+      "reason": "These exception classes carry different information: state schema versions and SQLite storage fault codes. Their similar constructors do not share a contract. Reviewed pair: src/omi_collector/capture/adapters/collector_state_db.py:64-75 ~ src/omi_collector/capture/application/storage_fault.py:6-17."
     }
   ]
 }

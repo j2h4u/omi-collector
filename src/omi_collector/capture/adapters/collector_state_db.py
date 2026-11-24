@@ -69,6 +69,14 @@ class StateDBError(RuntimeError):
         self.sqlite_errorcode = sqlite_errorcode
 
 
+class StateDBVersionError(StateDBError):
+    """An existing database has an unsupported schema version."""
+
+    def __init__(self, version: int) -> None:
+        super().__init__("state database schema is unsupported")
+        self.version = version
+
+
 def raise_if_sqlite_storage_fault(error: BaseException) -> None:
     """Classify only the error being handled, never an arbitrary cause chain."""
 
@@ -333,9 +341,10 @@ def _guarded_connect(uri: str, state_db: StateDB, *, timeout_ms: int) -> sqlite3
 class StateDB(_Operations):
     """Thread-safe facade; each call owns and closes its SQLite connection."""
 
-    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False, read_timeout_ms: int = _READ_BUSY_TIMEOUT_MS) -> None:
         self.path = Path(path).absolute()
         self.read_only = read_only
+        self._read_timeout_ms = read_timeout_ms
         self._active = threading.local()
         self._access_lock = threading.RLock()
         self._allow_create = not read_only and not self.path.exists()
@@ -475,7 +484,7 @@ class StateDB(_Operations):
                 raise StateDBError("state database does not exist")
             mode = "ro" if self.read_only else "rwc" if self._allow_create and not self.path.exists() else "rw"
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            timeout_ms = _READ_BUSY_TIMEOUT_MS if self.read_only else _BUSY_TIMEOUT_MS
+            timeout_ms = self._read_timeout_ms if self.read_only else _BUSY_TIMEOUT_MS
             connection = _guarded_connect(uri, self, timeout_ms=timeout_ms)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")
@@ -563,7 +572,9 @@ class StateDB(_Operations):
                 for row in _fetchall(connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
                 if not (name := _row_text(row, 0)).startswith("sqlite_")
             }
-            if version != _SCHEMA_VERSION or "state" not in tables:
+            if version != _SCHEMA_VERSION:
+                raise StateDBVersionError(version)
+            if "state" not in tables:
                 raise StateDBError("state database schema is unsupported")
             _validate_schema(connection)
             _validate_audio_schema(connection)
@@ -692,7 +703,7 @@ class StateDB(_Operations):
         connection: sqlite3.Connection | None = None
         try:
             uri = f"file:{quote(self.path.as_posix(), safe='/')}?mode={mode}"
-            timeout_ms = _READ_BUSY_TIMEOUT_MS if self.read_only else _BUSY_TIMEOUT_MS
+            timeout_ms = self._read_timeout_ms if self.read_only else _BUSY_TIMEOUT_MS
             connection = _guarded_connect(uri, self, timeout_ms=timeout_ms)
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout = {timeout_ms}")

@@ -220,10 +220,10 @@ def collect_operator_status(
     if end.tzinfo is None:
         raise OperatorStatusError("status clock must be timezone-aware")
     start = end.astimezone(UTC) - timedelta(hours=hours)
-    from omi_collector.state_migration import StateMigrationError, open_runtime_state
+    from omi_collector.state_migration import StateMigrationError, open_status_state
 
     try:
-        db = open_runtime_state(layout, read_only=True)
+        db = open_status_state(layout)
         observations = read_firmware_observations(db)
         spool = collect_spool_metrics(
             layout.publication.root,

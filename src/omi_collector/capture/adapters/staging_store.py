@@ -106,6 +106,16 @@ _UNKNOWN_REVISION = object()
 _PUBLICATION_ERROR_PATH_LIMIT = 256
 
 
+def _log_terminal_publication_rejection(root: Path, phase: str, error: Exception) -> None:
+    if isinstance(error, ReadyBundleError):
+        logger = configure_debug_logging(root)
+        logger.warning(
+            "diagnostic",
+            exc_info=error,
+            extra={"debug_event": "ready_publication_failure", "debug_fields": {"phase": phase}},
+        )
+
+
 def _debug_publication_failure(
     error: BaseException,
     *,
@@ -434,6 +444,7 @@ class StagingStore:
                     ReadyOutcome(ReadyOutcomeState.TRANSIENT, reason=_publication_io_reason(revision_error)),
                     _UNKNOWN_REVISION,
                 )
+            _log_terminal_publication_rejection(self._state_db.path.parent, phase, error)
             reason = str(error) if isinstance(error, ReadyBundleError) else type(error).__name__
             return ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=reason), revision
 
@@ -979,6 +990,7 @@ class StagingStore:
         except ReadySpaceError:
             raise
         except ReadyBundleError as error:
+            _log_terminal_publication_rejection(self._state_db.path.parent, "publication_effect", error)
             outcome = ReadyOutcome(ReadyOutcomeState.BLOCKED, reason=str(error), remaining_at_frontier=True)
         if (
             publication_closure is not None

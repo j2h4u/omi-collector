@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -451,6 +452,69 @@ def test_secondary_revision_access_denial_preserves_effect_error_context(
     assert diagnostics[1]["error_type"] == "PermissionError"
     assert diagnostics[1]["errno"] == errno.EACCES
     assert diagnostics[1]["path"] == str(failure_path)
+
+
+@pytest.mark.parametrize("site", ["finalize_public_audio_v2", "resume_retired_public_audio_v2"])
+def test_terminal_publication_rejection_logs_redacted_stack_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, site: str
+) -> None:
+    store = _store(tmp_path)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ReadyBundleError("private /secret/audio")
+
+    monkeypatch.setattr(staging_store_module, site, fail)
+    caplog.set_level(logging.INFO)
+    first = store.recover_and_publish()
+    assert first.state is ReadyOutcomeState.BLOCKED
+    assert first.reason == "private /secret/audio"
+    assert store.recover_and_publish().state is ReadyOutcomeState.BLOCKED
+    records = [record for record in caplog.records if "ready_publication_failure" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno >= logging.WARNING
+    assert "ReadyBundleError" in caplog.text
+    assert "capture/adapters/staging_store.py:" in caplog.text
+    assert "private" not in caplog.text
+    assert "/secret/audio" not in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_finalization_rejection_with_revision_failure_preserves_both_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = _store(tmp_path)
+    original_revision = store._publication_revision
+    calls = 0
+
+    def revision() -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise PermissionError(errno.EACCES, "private", str(tmp_path / "secret"))
+        return original_revision()
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ReadyBundleError("private /secret/audio")
+
+    monkeypatch.setattr(store, "_publication_revision", revision)
+    monkeypatch.setattr(staging_store_module, "finalize_public_audio_v2", fail)
+    diagnostics: list[dict[str, object]] = []
+
+    def capture(event: str, *_args: object, **fields: object) -> None:
+        if event == "ready_publication_failure":
+            diagnostics.append(fields)
+
+    monkeypatch.setattr(staging_store_module, "debug_event", capture)
+    caplog.set_level(logging.WARNING)
+    outcome = store.recover_and_publish()
+    assert outcome.state is ReadyOutcomeState.TRANSIENT
+    assert outcome.reason == "publication_access_denied"
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "ReadyBundleError" in warnings[0].getMessage()
+    assert any(item["phase"] == "post_effect_revision" and item["errno"] == errno.EACCES for item in diagnostics)
+    assert "private" not in caplog.text
+    assert "/secret/audio" not in caplog.text
 
 
 @dataclass

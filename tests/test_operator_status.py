@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from contextlib import closing
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import cast
 
@@ -271,6 +271,33 @@ def _state_db(layout: StorageLayout) -> StateDB:
         database = StateDB(layout.collector.state_db)
         database.put(StateKind.MIGRATION, "internal_audio_cutover", {"format": 1, "phase": "COMPLETE", "fresh": True})
     return open_runtime_state(layout)
+
+
+def test_status_dates_progress_written_during_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = _state_db(layout)
+    started = datetime.now(UTC).replace(microsecond=123000)
+    progress = started + timedelta(seconds=1)
+    finished = started + timedelta(seconds=5)
+    readings = iter((started, finished))
+
+    class ReportClock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> ReportClock:
+            assert tz == UTC
+            return cls.fromtimestamp(next(readings).timestamp(), tz)
+
+    def spool_during_progress(*_args: object, **_kwargs: object) -> SpoolMetrics:
+        write_runtime_status_event(database, "sync_progress", {"progress": {"status": "away"}}, progress.isoformat())
+        return _spool()
+
+    monkeypatch.setattr(status_module, "datetime", ReportClock)
+    monkeypatch.setattr(status_module, "collect_spool_metrics", spool_during_progress)
+    result = collect_operator_status(layout, hours=24)
+    runtime = cast(dict[str, object], result["runtime"])
+    assert datetime.fromisoformat(cast(str, result["generated_at"])) == finished
+    assert datetime.fromisoformat(cast(str, runtime["updated_at"])) == progress
+    assert runtime["updated_age_seconds"] == 4
 
 
 def test_status_skips_writer_admission_but_rejects_unsafe_database(

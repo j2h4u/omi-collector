@@ -219,7 +219,6 @@ def collect_operator_status(
     end = now or datetime.now(UTC)
     if end.tzinfo is None:
         raise OperatorStatusError("status clock must be timezone-aware")
-    start = end.astimezone(UTC) - timedelta(hours=hours)
     from omi_collector.state_migration import StateMigrationError, open_status_state
 
     try:
@@ -235,16 +234,15 @@ def collect_operator_status(
         )
         quality = _quality_window(
             db,
-            start,
+            end.astimezone(UTC) - timedelta(hours=hours),
             end.astimezone(UTC),
             confirmed_losses=confirmed_losses,
         )
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
-        runtime = _runtime_status(db, end.astimezone(UTC), operational_status, current_identity)
-        custody_holds, runtime["saved_unfinished_records"] = _audio_custody_counts(db)
-        audio_integrity = _audio_integrity_summary(db)
-        ble_scan_incident = _ble_scan_incident_summary(db)
+        runtime, custody_holds, audio_integrity, ble_scan_incident, generated = _read_dated_runtime_status(
+            db, now, operational_status, current_identity
+        )
     except (
         ConfirmedLossError,
         QualityMetricsError,
@@ -269,7 +267,7 @@ def collect_operator_status(
     return {
         "audio_integrity": audio_integrity,
         "device": device,
-        "generated_at": end.astimezone(UTC).isoformat(timespec="seconds"),
+        "generated_at": generated.isoformat(timespec="milliseconds"),
         "publication": spool.current_window.as_dict(),
         "quality_window": quality.as_dict(),
         "custody_holds": custody_holds,
@@ -750,11 +748,17 @@ def _audio_custody_counts(db: StateDB) -> tuple[int, int]:
     return holds, saved
 
 
-def _runtime_status(
-    db: StateDB, now: datetime, operational_status: dict[str, str], identity: OperationalIdentity
-) -> dict[str, object]:
+def _read_dated_runtime_status(
+    db: StateDB, now: datetime | None, operational_status: dict[str, str], identity: OperationalIdentity
+) -> tuple[dict[str, object], int, dict[str, object], dict[str, object], datetime]:
     projection = read_runtime_status(db) or {}
-    return _project_runtime_status(projection, now, operational_status, identity)
+    custody_holds, saved = _audio_custody_counts(db)
+    audio_integrity = _audio_integrity_summary(db)
+    ble_scan_incident = _ble_scan_incident_summary(db)
+    generated = (now or datetime.now(UTC)).astimezone(UTC)
+    runtime = _project_runtime_status(projection, generated, operational_status, identity)
+    runtime["saved_unfinished_records"] = saved
+    return runtime, custody_holds, audio_integrity, ble_scan_incident, generated
 
 
 def _project_runtime_status(

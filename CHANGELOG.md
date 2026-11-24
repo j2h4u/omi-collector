@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.20](https://github.com/j2h4u/omi-collector/compare/v1.1.19...v1.1.20) (2026-11-24)
+
+
+### Maintenance
+
+* **deps:** bump the github-actions group across 1 directory with 3 updates ([#351](https://github.com/j2h4u/omi-collector/issues/351)) ([f167f23](https://github.com/j2h4u/omi-collector/commit/f167f239fdbfc141da3f893fd8a7ab00ba67df79))
+
 ## [1.1.19](https://github.com/j2h4u/omi-collector/compare/v1.1.18...v1.1.19) (2026-11-24)
 
 

@@ -325,6 +325,56 @@ def test_operator_status_reads_ready_metadata_without_opening_audio(
     store.close()
 
 
+def test_saved_unfinished_records_tracks_resumable_capture(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    layout.publication.root.mkdir(parents=True)
+    database = _state_db(layout)
+    store = InternalAudioStore(database)
+    source_id = "a" * 32
+    raw = (10).to_bytes(4, "big") + bytes((2, 8, 1)) + bytes(AUDIO_RECORD_SIZE - 7)
+
+    def saved() -> object:
+        status = collect_operator_status(layout, hours=24, now=datetime(2026, 9, 8, 10, tzinfo=UTC))
+        return cast(dict[str, object], status["runtime"])["saved_unfinished_records"]
+
+    assert saved() == 0
+    store.create_source(source_id, "attempt", 10, 12)
+    assert saved() == 0
+    store.prepare_leg(source_id, 10, 2)
+    source = store.record_read_begin(source_id, 10, 2)
+    store.commit_drain(source_id, 0, (raw,), DrainCheckpoint(source.current_leg_generation))
+    assert saved() == 1
+    store.interrupt(source_id)
+    assert saved() == 1
+    store.prepare_leg(source_id, 10, 2)
+    source = store.record_read_begin(source_id, 10, 2)
+    store.commit_drain(
+        source_id, 0, (raw, (11).to_bytes(4, "big") + raw[4:]), DrainCheckpoint(source.current_leg_generation)
+    )
+    assert store.finish_read(source_id, 12, 2 * AUDIO_RECORD_SIZE)
+    source = store.get_source(source_id)
+    assert source is not None
+    store.seal_source(
+        source_id,
+        leg_generation=source.current_leg_generation,
+        expected_count=source.committed_count,
+        expected_sha256=source.committed_sha256,
+    )
+    assert saved() == 0
+    store.close()
+
+
+def test_saved_unfinished_records_rejects_multiple_resumable_captures(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    database = _state_db(layout)
+    store = InternalAudioStore(database)
+    store.create_source("a" * 32, "attempt", 10, 12)
+    store.create_source("b" * 32, "attempt", 20, 22)
+    with pytest.raises(OperatorStatusError, match="multiple unfinished captures"):
+        status_module._audio_custody_counts(database)
+    store.close()
+
+
 def test_operator_status_reads_committed_state_during_runtime_write(tmp_path: Path) -> None:
     layout = _layout(tmp_path)
     layout.publication.root.mkdir(parents=True)
@@ -805,7 +855,7 @@ def test_custody_hold_inventory_classifies_raw_sqlite_fault(
 
     monkeypatch.setattr(StateDB, "open_connection", fail_open)
     with pytest.raises(error_type) as raised:
-        status_module._custody_hold_count(db)
+        status_module._audio_custody_counts(db)
     assert raised.value.sqlite_errorcode == sqlite_errorcode  # type: ignore[attr-defined]
     assert "private SQLite detail" not in str(raised.value)
 
@@ -949,6 +999,7 @@ def test_status_summarizes_backlog_transfer_quality_and_loss(monkeypatch: pytest
         "last_observed_phy": None,
         "link_observation_state": {"state": "unknown", "observed_at": None, "reason": None},
         "operational_status": {"clock": "unknown", "publication": "unknown", "quality": "unknown"},
+        "saved_unfinished_records": 0,
         "state": "unknown",
         "transfer": None,
         "updated_age_seconds": None,

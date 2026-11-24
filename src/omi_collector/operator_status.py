@@ -242,7 +242,7 @@ def collect_operator_status(
         current_identity = identity or OperationalIdentity(system_host_boot_id(), os.environ.get("INVOCATION_ID"))
         operational_status = read_operational_status(db, current_identity)
         runtime = _runtime_status(db, end.astimezone(UTC), operational_status, current_identity)
-        custody_holds = _custody_hold_count(db)
+        custody_holds, runtime["saved_unfinished_records"] = _audio_custody_counts(db)
         audio_integrity = _audio_integrity_summary(db)
         ble_scan_incident = _ble_scan_incident_summary(db)
     except (
@@ -719,16 +719,20 @@ def _incident_diag_summary(value: object, keys: tuple[str, ...]) -> dict[str, ob
     return result
 
 
-def _custody_hold_count(db: StateDB) -> int:
-    """Count SQL audio held indefinitely after unresolved custody conflicts."""
+def _audio_custody_counts(db: StateDB) -> tuple[int, int]:
+    """Read held and resumable audio counts from one SQL snapshot."""
     try:
         with (
             closing(db.open_connection(read_only=True)) as connection,
             db.access(connection),
             closing(
                 connection.execute(
-                    "SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
-                    "AND lifecycle='blocked' AND block_reason IN (?, ?)",
+                    "SELECT (SELECT COUNT(*) FROM capture_source WHERE source_type='quarantine' "
+                    "AND lifecycle='blocked' AND block_reason IN (?, ?)), COUNT(*), COALESCE(MAX(committed_count), 0) "
+                    "FROM capture_source AS source WHERE source_type='attempt' "
+                    "AND lifecycle IN ('prepared','leg_prepared','receiving','interrupted') "
+                    "AND NOT EXISTS (SELECT 1 FROM capture_historical_custody AS h "
+                    "WHERE h.source_id=source.source_id AND h.disposition='pending')",
                     tuple(sorted(QUARANTINE_CUSTODY_HOLD_REASONS)),
                 )
             ) as cursor,
@@ -737,10 +741,13 @@ def _custody_hold_count(db: StateDB) -> int:
     except (OSError, sqlite3.DatabaseError, StateDBError) as error:
         raise_if_sqlite_storage_fault(error)
         raise OperatorStatusError("custody hold inventory is unreadable") from error
-    count = None if row is None else cast(object, row[0])
-    if type(count) is not int:
+    values = () if row is None else cast(tuple[object, ...], tuple(row))
+    if not values or any(type(value) is not int or value < 0 for value in values):
         raise OperatorStatusError("custody hold inventory is invalid")
-    return cast(int, count)
+    holds, attempts, saved = cast(tuple[int, int, int], values)
+    if attempts > 1:
+        raise OperatorStatusError("multiple unfinished captures block resume")
+    return holds, saved
 
 
 def _runtime_status(
